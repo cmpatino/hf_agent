@@ -23,6 +23,8 @@ class Config(BaseModel):
     session_dataset_repo: str = "akseljoonas/hf-agent-sessions"
     auto_save_interval: int = 3  # Save every N user turns (0 = disabled)
     yolo_mode: bool = False  # Auto-approve all tool calls without confirmation
+    max_iterations: int = 10  # Max agent iterations per turn (-1 for unlimited)
+    auto_continue: bool = False  # Auto-respond to agent questions in non-interactive mode
 
     # Permission control parameters
     confirm_cpu_jobs: bool = True

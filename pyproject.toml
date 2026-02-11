@@ -11,6 +11,16 @@ dependencies = [
     "python-dotenv>=1.2.1",
 ]
 
+[project.scripts]
+hf-agent = "agent.main:cli_main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["agent*"]
+exclude = ["eval*", "backend*", "frontend*", "session_logs*", "configs*"]
+
 [project.optional-dependencies]
 # Agent runtime dependencies
 agent = [

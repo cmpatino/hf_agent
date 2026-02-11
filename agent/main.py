@@ -2,9 +2,11 @@
 Interactive CLI chat with the agent
 """
 
+import argparse
 import asyncio
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -444,18 +446,97 @@ async def get_user_input(prompt_session: PromptSession) -> str:
     return await prompt_session.prompt_async(HTML("\n<b><cyan>></cyan></b> "))
 
 
-async def main():
-    """Interactive chat with the agent"""
+async def json_event_listener(
+    event_queue: asyncio.Queue,
+    submission_queue: asyncio.Queue,
+    turn_complete_event: asyncio.Event,
+    ready_event: asyncio.Event,
+    config=None,
+) -> None:
+    """Background task that listens for events and outputs them as JSON (non-interactive mode)"""
+    submission_id = [1000]
+
+    while True:
+        try:
+            event = await event_queue.get()
+
+            # Output event as JSON
+            event_data = {
+                "event_type": event.event_type,
+                "data": event.data if event.data else {},
+            }
+            print(json.dumps(event_data), flush=True)
+
+            # Handle special events
+            if event.event_type == "ready":
+                ready_event.set()
+            elif event.event_type == "turn_complete":
+                turn_complete_event.set()
+            elif event.event_type == "error":
+                turn_complete_event.set()
+            elif event.event_type == "shutdown":
+                break
+            elif event.event_type == "approval_required":
+                # In non-interactive mode with yolo, auto-approve everything
+                tools_data = event.data.get("tools", []) if event.data else []
+
+                if config and config.yolo_mode:
+                    approvals = [
+                        {
+                            "tool_call_id": t.get("tool_call_id", ""),
+                            "approved": True,
+                            "feedback": None,
+                        }
+                        for t in tools_data
+                    ]
+                    submission_id[0] += 1
+                    approval_submission = Submission(
+                        id=f"approval_{submission_id[0]}",
+                        operation=Operation(
+                            op_type=OpType.EXEC_APPROVAL,
+                            data={"approvals": approvals},
+                        ),
+                    )
+                    await submission_queue.put(approval_submission)
+                else:
+                    # In non-interactive mode without yolo, deny all approvals
+                    approvals = [
+                        {
+                            "tool_call_id": t.get("tool_call_id", ""),
+                            "approved": False,
+                            "feedback": "Non-interactive mode: approval required but not in yolo mode",
+                        }
+                        for t in tools_data
+                    ]
+                    submission_id[0] += 1
+                    approval_submission = Submission(
+                        id=f"approval_{submission_id[0]}",
+                        operation=Operation(
+                            op_type=OpType.EXEC_APPROVAL,
+                            data={"approvals": approvals},
+                        ),
+                    )
+                    await submission_queue.put(approval_submission)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            error_event = {"event_type": "error", "data": {"error": str(e)}}
+            print(json.dumps(error_event), flush=True)
+
+
+async def run_interactive(config, tool_router):
+    """Run in interactive mode"""
     from agent.utils.terminal_display import Colors
 
     # Clear screen
     os.system("clear" if os.name != "nt" else "cls")
 
     banner = r"""
-  _   _                   _               _____                   _                    _   
- | | | |_   _  __ _  __ _(_)_ __   __ _  |  ___|_ _  ___ ___     / \   __ _  ___ _ __ | |_ 
+  _   _                   _               _____                   _                    _
+ | | | |_   _  __ _  __ _(_)_ __   __ _  |  ___|_ _  ___ ___     / \   __ _  ___ _ __ | |_
  | |_| | | | |/ _` |/ _` | | '_ \ / _` | | |_ / _` |/ __/ _ \   / _ \ / _` |/ _ \ '_ \| __|
- |  _  | |_| | (_| | (_| | | | | | (_| | |  _| (_| | (_|  __/  / ___ \ (_| |  __/ | | | |_ 
+ |  _  | |_| | (_| | (_| | | | | | (_| | |  _| (_| | (_|  __/  / ___ \ (_| |  __/ | | | |_
  |_| |_|\__,_|\__, |\__, |_|_| |_|\__, | |_|  \__,_|\___\___| /_/   \_\__, |\___|_| |_|\__|
               |___/ |___/         |___/                               |___/
     """
@@ -464,7 +545,6 @@ async def main():
     print(f"{Colors.YELLOW} {banner}{Colors.RESET}")
     print("Type your messages below. Type 'exit', 'quit', or '/quit' to end.\n")
     print(format_separator())
-    # Wait for agent to initialize
     print("Initializing agent...")
 
     # Create queues for communication
@@ -475,14 +555,6 @@ async def main():
     turn_complete_event = asyncio.Event()
     turn_complete_event.set()
     ready_event = asyncio.Event()
-
-    # Start agent loop in background
-    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
-    config = load_config(config_path)
-
-    # Create tool router
-    print(f"Loading MCP servers: {', '.join(config.mcpServers.keys())}")
-    tool_router = ToolRouter(config.mcpServers)
 
     # Create prompt session for input
     prompt_session = PromptSession()
@@ -541,7 +613,6 @@ async def main():
                     op_type=OpType.USER_INPUT, data={"text": user_input}
                 ),
             )
-            # print(f"Main submitting: {submission.operation.op_type}")
             await submission_queue.put(submission)
 
     except KeyboardInterrupt:
@@ -560,8 +631,210 @@ async def main():
     print("✨ Goodbye!\n")
 
 
-if __name__ == "__main__":
+async def run_non_interactive(config, tool_router, prompt: str):
+    """Run in non-interactive mode with a single prompt"""
+    # Create queues for communication
+    submission_queue = asyncio.Queue()
+    event_queue = asyncio.Queue()
+
+    # Events to signal agent state
+    turn_complete_event = asyncio.Event()
+    turn_complete_event.set()
+    ready_event = asyncio.Event()
+
+    agent_task = asyncio.create_task(
+        submission_loop(
+            submission_queue,
+            event_queue,
+            config=config,
+            tool_router=tool_router,
+        )
+    )
+
+    # Start JSON event listener in background
+    listener_task = asyncio.create_task(
+        json_event_listener(
+            event_queue,
+            submission_queue,
+            turn_complete_event,
+            ready_event,
+            config,
+        )
+    )
+
+    await ready_event.wait()
+
+    # Submit the prompt
+    submission = Submission(
+        id="sub_1",
+        operation=Operation(op_type=OpType.USER_INPUT, data={"text": prompt}),
+    )
+    await submission_queue.put(submission)
+
+    # Wait for turn to complete
+    turn_complete_event.clear()
+    await turn_complete_event.wait()
+
+    # Shutdown
+    shutdown_submission = Submission(
+        id="sub_shutdown", operation=Operation(op_type=OpType.SHUTDOWN)
+    )
+    await submission_queue.put(shutdown_submission)
+
+    await asyncio.wait_for(agent_task, timeout=5.0)
+    listener_task.cancel()
+
+
+async def main():
+    """Main entry point with CLI argument parsing"""
+    parser = argparse.ArgumentParser(
+        description="Hugging Face Agent CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive mode
+  hf-agent
+
+  # Non-interactive with text prompt
+  hf-agent -p "Show me the latest models"
+
+  # Non-interactive with prompt from file (using @ prefix)
+  hf-agent -p @prompt.txt
+
+  # Non-interactive with prompt from file (direct path)
+  hf-agent -p ./prompts/task.txt
+
+  # With yolo mode and JSON output
+  hf-agent --yolo --output-format stream-json -p "Deploy a model"
+        """,
+    )
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        type=str,
+        help="Initial prompt for non-interactive mode. Can be text or a file path (prefix with @ or provide valid file path)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Path to agent config JSON file",
+    )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="Enable yolo mode (auto-approve all tool calls)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        help="Max agent iterations per turn (-1 for unlimited)",
+    )
+    parser.add_argument(
+        "--auto-continue",
+        action="store_true",
+        help="Auto-respond to agent questions (non-interactive mode only)",
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        choices=["stream-json", "text"],
+        default="text",
+        help="Output format (stream-json for JSON events, text for human-readable)",
+    )
+
+    args = parser.parse_args()
+
+    # Determine config path
+    if args.model:
+        config_path = Path(args.model)
+    else:
+        config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
+
+    # Load config
+    config = load_config(config_path)
+
+    # Override yolo mode if specified
+    if args.yolo:
+        config.yolo_mode = True
+
+    # Override max_iterations if specified
+    if args.max_iterations is not None:
+        config.max_iterations = args.max_iterations
+
+    # Override auto_continue if specified (only in non-interactive mode)
+    if args.auto_continue and args.prompt:
+        config.auto_continue = True
+
+    # Create tool router
+    if args.output_format != "stream-json":
+        print(f"Loading MCP servers: {', '.join(config.mcpServers.keys())}")
+    tool_router = ToolRouter(config.mcpServers)
+
+    # Run in appropriate mode
+    if args.prompt:
+        # Process prompt - check if it's a file reference
+        prompt_text = args.prompt
+        loaded_from_file = False
+
+        # Check if prompt starts with @ (file reference)
+        if prompt_text.startswith("@"):
+            file_path = Path(prompt_text[1:])  # Remove @ prefix
+            try:
+                prompt_text = file_path.read_text(encoding="utf-8")
+                loaded_from_file = True
+                if args.output_format != "stream-json":
+                    print(f"Loaded prompt from file: {file_path}")
+            except FileNotFoundError:
+                print(f"Error: Prompt file not found: {file_path}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error reading prompt file: {e}", file=sys.stderr)
+                sys.exit(1)
+        # Otherwise check if it's a valid file path
+        elif Path(prompt_text).is_file():
+            file_path = Path(prompt_text)
+            try:
+                prompt_text = file_path.read_text(encoding="utf-8")
+                loaded_from_file = True
+                if args.output_format != "stream-json":
+                    print(f"Loaded prompt from file: {file_path}")
+            except Exception as e:
+                print(f"Error reading prompt file: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Show preview of prompt if loaded from file
+        if loaded_from_file and args.output_format != "stream-json":
+            lines = prompt_text.split("\n")
+            preview_lines = lines[:5]
+            print("\nPrompt preview (first 5 lines):")
+            print("-" * 50)
+            for line in preview_lines:
+                print(line)
+            if len(lines) > 5:
+                print("...")
+            print("-" * 50)
+
+        # Non-interactive mode
+        if args.output_format != "stream-json":
+            print("Running in non-interactive mode...")
+        await run_non_interactive(config, tool_router, prompt_text)
+    else:
+        # Interactive mode
+        if args.output_format == "stream-json":
+            print(
+                "Warning: stream-json output format is only supported in non-interactive mode",
+                file=sys.stderr,
+            )
+        await run_interactive(config, tool_router)
+
+
+def cli_main():
+    """CLI entry point"""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n\n✨ Goodbye!")
+
+
+if __name__ == "__main__":
+    cli_main()

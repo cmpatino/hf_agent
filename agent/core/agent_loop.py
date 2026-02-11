@@ -98,7 +98,7 @@ class Handlers:
     @staticmethod
     @observe(name="run_agent")
     async def run_agent(
-        session: Session, text: str, max_iterations: int = 10
+        session: Session, text: str, max_iterations: int | None = None
     ) -> str | None:
         """
         Handle user input (like user_input_or_turn in codex.rs:1291)
@@ -121,10 +121,12 @@ class Handlers:
         )
 
         # Agentic loop - continue until model doesn't call tools or max iterations is reached
+        if max_iterations is None:
+            max_iterations = session.config.max_iterations
         iteration = 0
         final_response = None
 
-        while iteration < max_iterations:
+        while max_iterations == -1 or iteration < max_iterations:
             messages = session.context_manager.get_messages()
             tools = session.tool_router.get_tool_specs_for_llm()
 
@@ -154,6 +156,25 @@ class Handlers:
                             )
                         )
                         final_response = content
+
+                        # If auto_continue is enabled and response looks like a question, auto-respond
+                        if session.config.auto_continue and ("?" in content or
+                                                             any(word in content.lower() for word in
+                                                             ["should i", "would you like", "do you want",
+                                                              "which", "what do you think", "please confirm"])):
+                            # Add automatic user response
+                            auto_response = "Whatever you think is best. Continue autonomously."
+                            user_msg = Message(role="user", content=auto_response)
+                            session.context_manager.add_message(user_msg)
+                            await session.send_event(
+                                Event(
+                                    event_type="assistant_message",
+                                    data={"content": f"\n[Auto-response: {auto_response}]"},
+                                )
+                            )
+                            # Continue the loop instead of breaking
+                            iteration += 1
+                            continue
                     break
 
                 # Add assistant message with tool calls to history
