@@ -32,6 +32,32 @@ cd hf_agent
 uv sync --extra agent # or uv sync --extra all
 ```
 
+#### Install the CLI for use outside the repo
+
+From the project root, install the package in editable mode with the agent extra so the `hf-agent` command is available on your PATH:
+
+```bash
+# With uv (recommended)
+uv pip install -e ".[agent]"
+
+# Or with pip
+pip install -e ".[agent]"
+```
+
+Then run the CLI from anywhere:
+
+```bash
+hf-agent                                    # interactive mode
+hf-agent -p "Your prompt" --output-file events.jsonl --verbose   # non-interactive
+hf-agent --help
+```
+
+You can also use `uv tool install` to install from a local path into a dedicated environment:
+
+```bash
+uv tool install --path /path/to/hf_agent hf-agent
+```
+
 ### Interactive CLI
 
 ```bash
@@ -40,6 +66,25 @@ uv run python -m agent.main
 This starts an interactive chat session with the agent. Type your messages and the agent will respond, using tools as needed.
 
 The agent will automatically discover and register all tools from configured MCP servers.
+
+### Non-interactive CLI (one-shot prompt)
+
+Run a single prompt and stream machine-readable progress to a file for external monitoring (e.g. CI or scripts). Tool approvals are auto-approved in this mode.
+
+```bash
+uv run python -m agent.main --prompt "Your prompt here" \
+  --output-format stream-json --output-file /tmp/hf-agent.jsonl \
+  --model "$AGENT_CONFIG" --verbose
+```
+
+- `--prompt` / `-p`: The user prompt; enables non-interactive mode.
+- `--output-file`: Path for JSON Lines event stream (one JSON object per line, flushed after each write).
+- `--output-format stream-json`: Use stream-json format; if set without `--output-file`, defaults to `hf_agent_events.jsonl` in the current directory.
+- `--model`: Override model name from config.
+- `--verbose` / `-v`: Log event types to stderr.
+- `--config`: Path to agent config JSON (default: `configs/main_agent_config.json`).
+
+**Output schema (JSON Lines):** Each line is a JSON object with `ts`, `seq`, `event_type`, `data`, `session_id`, and `mode: "non_interactive"`. The last line is a summary with `event_type: "run_complete"` and `data` containing `success`, `duration_ms`, `exit_code`, `final_assistant_message`, `tool_call_count`, `tool_error_count`. You can `tail -f` the output file to monitor progress.
 
 
 ### Env Setup

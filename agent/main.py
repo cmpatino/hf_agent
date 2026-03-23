@@ -1,11 +1,14 @@
 """
-Interactive CLI chat with the agent
+Interactive and non-interactive CLI for the agent.
 """
 
+import argparse
 import asyncio
 import json
 import os
-from dataclasses import dataclass
+import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -65,6 +68,205 @@ class Submission:
 
     id: str
     operation: Operation
+
+
+@dataclass
+class NonInteractiveRunState:
+    """Mutable state for a single non-interactive run."""
+
+    seq: int = 0
+    tool_call_count: int = 0
+    tool_error_count: int = 0
+    final_assistant_message: Optional[str] = None
+    success: bool = False
+    error_seen: bool = False
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+def _write_jsonl_line(
+    path: Path,
+    obj: dict[str, Any],
+) -> None:
+    """Append one JSON line to path and flush."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+async def _non_interactive_event_listener(
+    event_queue: asyncio.Queue,
+    submission_queue: asyncio.Queue,
+    session_id: str,
+    run_state: NonInteractiveRunState,
+    output_file: Optional[Path],
+    verbose: bool,
+    ready_event: asyncio.Event,
+) -> None:
+    """
+    Consume events in non-interactive mode: write JSONL, auto-approve approvals,
+    track counts and final message, signal when turn completes or errors.
+    """
+    while True:
+        try:
+            event = await event_queue.get()
+
+            if event.event_type == "ready":
+                run_state.done_event.clear()
+                ready_event.set()
+            elif event.event_type == "assistant_message" and event.data:
+                run_state.final_assistant_message = event.data.get("content") or ""
+            elif event.event_type == "tool_call":
+                run_state.tool_call_count += 1
+            elif event.event_type == "tool_output" and event.data:
+                if not event.data.get("success", False):
+                    run_state.tool_error_count += 1
+            elif event.event_type == "turn_complete":
+                if not run_state.error_seen:
+                    run_state.success = True
+                run_state.done_event.set()
+            elif event.event_type == "error":
+                run_state.error_seen = True
+                run_state.success = False
+                run_state.done_event.set()
+            elif event.event_type == "approval_required" and event.data:
+                tools_data = event.data.get("tools", []) or []
+                approvals = [
+                    {"tool_call_id": t.get("tool_call_id", ""), "approved": True, "feedback": None}
+                    for t in tools_data
+                ]
+                submission = Submission(
+                    id="approval_noninteractive",
+                    operation=Operation(op_type=OpType.EXEC_APPROVAL, data={"approvals": approvals}),
+                )
+                await submission_queue.put(submission)
+            elif event.event_type == "shutdown":
+                break
+
+            if output_file is not None:
+                run_state.seq += 1
+                line_obj = {
+                    "ts": time.time(),
+                    "seq": run_state.seq,
+                    "event_type": event.event_type,
+                    "data": event.data,
+                    "session_id": session_id,
+                    "mode": "non_interactive",
+                }
+                _write_jsonl_line(output_file, line_obj)
+
+            if verbose and event.event_type in (
+                "tool_call",
+                "tool_output",
+                "assistant_message",
+                "turn_complete",
+                "error",
+            ):
+                print(f"[{event.event_type}]", file=sys.stderr)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            if verbose:
+                print(f"Event listener error: {e}", file=sys.stderr)
+            run_state.success = False
+            run_state.done_event.set()
+
+
+async def run_non_interactive(args: argparse.Namespace) -> int:
+    """
+    One-shot run: submit prompt, auto-approve tool calls, stream events to file, exit.
+    Returns exit code (0 on success).
+    """
+    config_path = args.config
+    if config_path is None:
+        config_path = str(Path(__file__).parent.parent / "configs" / "main_agent_config.json")
+    config = load_config(config_path)
+    if args.model is not None:
+        config.model_name = args.model
+    config.yolo_mode = True
+
+    output_file = Path(args.output_file) if args.output_file else None
+    if output_file is None and args.output_format == "stream-json":
+        output_file = Path(os.getcwd()) / "hf_agent_events.jsonl"
+
+    submission_queue: asyncio.Queue = asyncio.Queue()
+    event_queue: asyncio.Queue = asyncio.Queue()
+    ready_event = asyncio.Event()
+    run_state = NonInteractiveRunState()
+
+    tool_router = ToolRouter(config.mcpServers)
+    agent_task = asyncio.create_task(
+        submission_loop(
+            submission_queue,
+            event_queue,
+            config=config,
+            tool_router=tool_router,
+        )
+    )
+
+    session_id = "noninteractive"
+    listener_task = asyncio.create_task(
+        _non_interactive_event_listener(
+            event_queue,
+            submission_queue,
+            session_id,
+            run_state,
+            output_file,
+            args.verbose,
+            ready_event,
+        )
+    )
+
+    await ready_event.wait()
+    start = time.perf_counter()
+
+    await submission_queue.put(
+        Submission(
+            id="sub_1",
+            operation=Operation(op_type=OpType.USER_INPUT, data={"text": args.prompt}),
+        )
+    )
+
+    await run_state.done_event.wait()
+    duration_ms = int((time.perf_counter() - start) * 1000)
+    exit_code = 0 if run_state.success else 1
+
+    if output_file is not None:
+        summary = {
+            "ts": time.time(),
+            "seq": run_state.seq + 1,
+            "event_type": "run_complete",
+            "mode": "non_interactive",
+            "session_id": session_id,
+            "data": {
+                "success": run_state.success,
+                "duration_ms": duration_ms,
+                "exit_code": exit_code,
+                "final_assistant_message": run_state.final_assistant_message,
+                "tool_call_count": run_state.tool_call_count,
+                "tool_error_count": run_state.tool_error_count,
+            },
+        }
+        _write_jsonl_line(output_file, summary)
+
+    await submission_queue.put(
+        Submission(id="sub_shutdown", operation=Operation(op_type=OpType.SHUTDOWN))
+    )
+    try:
+        await asyncio.wait_for(agent_task, timeout=10.0)
+    except asyncio.TimeoutError:
+        agent_task.cancel()
+        try:
+            await agent_task
+        except asyncio.CancelledError:
+            pass
+    listener_task.cancel()
+    try:
+        await listener_task
+    except asyncio.CancelledError:
+        pass
+
+    return exit_code
 
 
 async def event_listener(
@@ -560,8 +762,63 @@ async def main():
     print("✨ Goodbye!\n")
 
 
-if __name__ == "__main__":
+def parse_args(args: Optional[list[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments. Defaults to interactive mode when --prompt is not set."""
+    parser = argparse.ArgumentParser(
+        description="HF Agent CLI: interactive chat or one-shot prompt execution.",
+    )
+    parser.add_argument(
+        "-p",
+        "--prompt",
+        type=str,
+        default=None,
+        help="Run in non-interactive mode with this prompt and exit after one turn.",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default=None,
+        help="In non-interactive mode, stream JSON events to this file (one JSON object per line).",
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        choices=["stream-json"],
+        default=None,
+        help="Output format for non-interactive mode; only 'stream-json' is supported.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Override model name from config (e.g. litellm model string or path to config).",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Emit extra progress to stderr in non-interactive mode.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to agent config JSON (default: configs/main_agent_config.json).",
+    )
+    return parser.parse_args(args)
+
+
+def cli() -> None:
+    """Sync entry point for the installed `hf-agent` console script."""
+    parsed = parse_args()
+    if parsed.prompt is not None:
+        exit_code = asyncio.run(run_non_interactive(parsed))
+        sys.exit(exit_code)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n\n✨ Goodbye!")
+
+
+if __name__ == "__main__":
+    cli()
